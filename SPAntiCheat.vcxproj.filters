@@ -48,5 +48,8 @@
     <Image Include="C:\Users\Administrator\Downloads\ls_hologram.ico">
       <Filter>Resource Files</Filter>
     </Image>
+    <Image Include="c:\users\administrator\downloads\icon2.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
   </ItemGroup>
 </Project>

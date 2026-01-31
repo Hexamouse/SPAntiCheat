@@ -139,6 +139,7 @@
     <ResourceCompile Include="SPAntiCheat.rc" />
   </ItemGroup>
   <ItemGroup>
+    <Image Include="c:\users\administrator\downloads\icon2.ico" />
     <Image Include="C:\Users\Administrator\Downloads\ls_hologram.ico" />
     <Image Include="small.ico" />
     <Image Include="SPAntiCheat.ico" />

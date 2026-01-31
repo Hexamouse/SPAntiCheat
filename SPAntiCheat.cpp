@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <aclapi.h>
 #include <thread>
 #include <chrono>
 #include <vector>
@@ -25,6 +26,9 @@
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "user32.lib")
 
 #define MAX_LOADSTRING 100
 #define WM_TRAYICON (WM_USER + 1)
@@ -56,10 +60,28 @@ std::vector<std::wstring> processBlacklist = {
     L"cheatengine", L"x32dbg", L"x64dbg", L"ollydbg",
     L"processhacker", L"procmon", L"wireshark", L"ida64",
     L"dnspy", L"netlimiter", L"ksdumper", L"httpdebugger",
-    L"systeminformer", L"perfwatson2", L"reclass", L"procexp"
+    L"systeminformer", L"reclass", L"procexp"
 };
 
 // ================= HELPER FUNCTIONS =================
+
+void InitLog() {
+    std::ofstream logFile("SPAntiCheat.log", std::ios::trunc);
+    if (logFile.is_open()) {
+        time_t now = time(0);
+        tm ltm;
+        localtime_s(&ltm, &now);
+        logFile << "========== SPAntiCheat Log Started ["
+            << std::setfill('0') << std::setw(2) << ltm.tm_mday << "/"
+            << std::setfill('0') << std::setw(2) << (ltm.tm_mon + 1) << "/"
+            << (ltm.tm_year + 1900) << " "
+            << std::setfill('0') << std::setw(2) << ltm.tm_hour << ":"
+            << std::setfill('0') << std::setw(2) << ltm.tm_min << ":"
+            << std::setfill('0') << std::setw(2) << ltm.tm_sec
+            << "] ==========" << std::endl;
+        logFile.close();
+    }
+}
 
 void WriteLog(const std::string& text) {
     std::ofstream logFile("SPAntiCheat.log", std::ios::app);
@@ -243,9 +265,190 @@ void ScanBlacklistedTools() {
     }
 }
 
+// ================= REGISTRY MODULE =================
+
+const LPCWSTR REG_RUN_KEY = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+const LPCWSTR REG_APP_KEY = L"SOFTWARE\\SPAntiCheat";
+const LPCWSTR REG_VALUE_NAME = L"SPAntiCheat";
+
+// 1. Auto-Start: Jalankan otomatis saat Windows boot
+bool RegisterAutoStart() {
+    WCHAR exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey);
+    if (result != ERROR_SUCCESS) return false;
+
+    result = RegSetValueExW(hKey, REG_VALUE_NAME, 0, REG_SZ,
+        (const BYTE*)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(WCHAR)));
+    RegCloseKey(hKey);
+
+    if (result == ERROR_SUCCESS) {
+        WriteLog("REGISTRY: Auto-start registered.");
+        return true;
+    }
+    return false;
+}
+
+bool RemoveAutoStart() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS)
+        return false;
+    LONG result = RegDeleteValueW(hKey, REG_VALUE_NAME);
+    RegCloseKey(hKey);
+    return result == ERROR_SUCCESS;
+}
+
+// 2. Simpan config ke Registry (CRC hash sebagai watchdog)
+bool SaveConfigToRegistry() {
+    HKEY hKey;
+    DWORD disposition;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, &disposition);
+    if (result != ERROR_SUCCESS) return false;
+
+    // Simpan CRC hash anti-cheat sebagai referensi
+    RegSetValueExW(hKey, L"IntegrityHash", 0, REG_DWORD,
+        (const BYTE*)&originalCRC, sizeof(DWORD));
+
+    // Simpan path executable
+    WCHAR exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    RegSetValueExW(hKey, L"InstallPath", 0, REG_SZ,
+        (const BYTE*)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(WCHAR)));
+
+    // Simpan timestamp install
+    ULONGLONG timestamp = GetTickCount64();
+    RegSetValueExW(hKey, L"InstallTime", 0, REG_QWORD,
+        (const BYTE*)&timestamp, sizeof(ULONGLONG));
+
+    RegCloseKey(hKey);
+    WriteLog("REGISTRY: Config saved.");
+    return true;
+}
+
+// 3. Watchdog: Cek apakah registry di-tamper oleh cheater
+bool VerifyRegistryIntegrity() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_APP_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        // Key tidak ada = pertama kali jalan, atau dihapus cheater
+        WriteLog("REGISTRY: Config key missing - first run or tampered.");
+        return false;
+    }
+
+    // Baca CRC yang tersimpan
+    DWORD storedCRC = 0;
+    DWORD dataSize = sizeof(DWORD);
+    LONG result = RegQueryValueExW(hKey, L"IntegrityHash", NULL, NULL,
+        (BYTE*)&storedCRC, &dataSize);
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) return false;
+
+    // Bandingkan dengan CRC aktual
+    if (storedCRC != 0 && storedCRC != originalCRC) {
+        WriteLog("REGISTRY: Integrity mismatch! File may be tampered.");
+        return false;
+    }
+
+    return true;
+}
+
+// 4. Cek apakah auto-start masih terdaftar (anti-removal)
+bool IsAutoStartIntact() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+
+    WCHAR value[MAX_PATH];
+    DWORD dataSize = sizeof(value);
+    LONG result = RegQueryValueExW(hKey, REG_VALUE_NAME, NULL, NULL, (BYTE*)value, &dataSize);
+    RegCloseKey(hKey);
+
+    return result == ERROR_SUCCESS;
+}
+
+// 5. Uninstall: Hapus semua registry entries dan log file
+void CleanupAndUninstall() {
+    // Hapus auto-start dari Run key
+    RemoveAutoStart();
+    WriteLog("UNINSTALL: Auto-start removed.");
+
+    // Hapus config key HKCU\SOFTWARE\SPAntiCheat beserta semua values
+    LONG result = RegDeleteKeyW(HKEY_CURRENT_USER, REG_APP_KEY);
+    if (result == ERROR_SUCCESS) {
+        WriteLog("UNINSTALL: Registry config key deleted.");
+    }
+
+    // Cleanup shared memory
+    if (pSharedHeartbeat) { UnmapViewOfFile(pSharedHeartbeat); pSharedHeartbeat = NULL; }
+    if (hMapFile) { CloseHandle(hMapFile); hMapFile = NULL; }
+
+    // Cleanup game handle
+    if (hGame) { CloseHandle(hGame); hGame = NULL; }
+
+    WriteLog("UNINSTALL: Cleanup complete. SPAntiCheat uninstalled.");
+
+    // Hapus log file terakhir (opsional)
+    // DeleteFileW(L"SPAntiCheat.log");
+}
+
+
+bool ProtectProcess() {
+    HANDLE hProcess = GetCurrentProcess();
+
+    // Buat SID untuk "Everyone"
+    SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+    PSID pEveryoneSid = NULL;
+    if (!AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID,
+        0, 0, 0, 0, 0, 0, 0, &pEveryoneSid)) {
+        WriteLog("PROTECT: Failed to create Everyone SID.");
+        return false;
+    }
+
+    // Deny akses berbahaya: terminate, inject, suspend
+    EXPLICIT_ACCESS denyAccess = { 0 };
+    denyAccess.grfAccessPermissions = PROCESS_TERMINATE |
+        PROCESS_VM_WRITE |
+        PROCESS_VM_OPERATION |
+        PROCESS_CREATE_THREAD |
+        PROCESS_SUSPEND_RESUME;
+    denyAccess.grfAccessMode = DENY_ACCESS;
+    denyAccess.grfInheritance = NO_INHERITANCE;
+    denyAccess.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    denyAccess.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    denyAccess.Trustee.ptstrName = (LPWSTR)pEveryoneSid;
+
+    // Buat DACL baru dengan deny rule
+    PACL pNewDacl = NULL;
+    DWORD dwResult = SetEntriesInAcl(1, &denyAccess, NULL, &pNewDacl);
+    if (dwResult != ERROR_SUCCESS) {
+        FreeSid(pEveryoneSid);
+        WriteLog("PROTECT: Failed to create ACL.");
+        return false;
+    }
+
+    // Terapkan DACL ke proses sendiri
+    dwResult = SetSecurityInfo(hProcess, SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION, NULL, NULL, pNewDacl, NULL);
+
+    LocalFree(pNewDacl);
+    FreeSid(pEveryoneSid);
+
+    if (dwResult == ERROR_SUCCESS) {
+        WriteLog("PROTECT: Process protection applied (Anti-Kill DACL).");
+        return true;
+    }
+
+    WriteLog("PROTECT: Failed to apply process protection.");
+    return false;
+}
+
 void AntiCheatLoop() {
-    // [FIX] Error E0020 Fixed: Fungsi ini sekarang sudah didefinisikan di atas
+    InitLog(); // Reset log setiap kali anti-cheat mulai jalan
     EnableDebugPrivilege();
+    ProtectProcess();
 
     InitSharedMemory();
     InitCRC32Table();
@@ -256,10 +459,13 @@ void AntiCheatLoop() {
     WriteLog("SYSTEM: Integrity Hash: " + std::to_string(originalCRC));
     WriteLog("SYSTEM: Advanced Security Active.");
 
+    // === REGISTRY SETUP ===
+    RegisterAutoStart();
+    SaveConfigToRegistry();
+
     int integrityCheckCounter = 0;
 
     while (true) {
-        // [HEARTBEAT 64-BIT]
         if (pSharedHeartbeat) {
             *pSharedHeartbeat = GetTickCount64();
         }
@@ -283,6 +489,18 @@ void AntiCheatLoop() {
             if (integrityCheckCounter > 10) {
                 DWORD currentCRC = CalculateFileCRC32(path);
                 if (currentCRC != originalCRC) ForceCloseGame("Anti-Cheat File Tampered/Patched");
+
+                // Cek apakah cheater menghapus auto-start dari registry
+                if (!IsAutoStartIntact()) {
+                    WriteLog("REGISTRY: Auto-start was removed! Re-registering...");
+                    RegisterAutoStart();
+                }
+
+                // Verify registry integrity
+                if (!VerifyRegistryIntegrity()) {
+                    SaveConfigToRegistry(); // Re-save jika di-tamper
+                }
+
                 integrityCheckCounter = 0;
             }
         }
@@ -320,9 +538,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             POINT pt; GetCursorPos(&pt);
             SetForegroundWindow(hWnd);
             HMENU hMenu = CreatePopupMenu();
-            AppendMenu(hMenu, MF_STRING, 1001, L"Exit Anti-Cheat");
             int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hWnd, NULL);
-            if (cmd == 1001) SendMessage(hWnd, WM_CLOSE, 0, 0);
+            if (cmd == 1002) {
+                int confirm = MessageBoxW(hWnd,
+                    L"Are you sure you want to uninstall SPAntiCheat?\n\n"
+                    L"This will remove:\n"
+                    L"  - Auto-start registry entry\n"
+                    L"  - Configuration registry key\n"
+                    L"  - Shared memory\n\n"
+                    L"The game will also be closed if running.",
+                    L"SPAntiCheat - Uninstall",
+                    MB_YESNO | MB_ICONWARNING);
+                if (confirm == IDYES) {
+                    targetPID = GetPIDByName(TARGET_GAME);
+                    if (targetPID != 0) ForceCloseGame("AC Uninstalled by User");
+                    CleanupAndUninstall();
+                    Shell_NotifyIcon(NIM_DELETE, &nid);
+                    PostQuitMessage(0);
+                }
+            }
             DestroyMenu(hMenu);
         }
         break;
