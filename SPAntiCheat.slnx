@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="SPAntiCheat.vcxproj" Id="50e3c5dc-83b5-4ad4-a9b3-5506aeb7efab" />
+</Solution>
