@@ -11,6 +11,7 @@
 #include "SPAntiCheat.h"
 #include <shellapi.h>
 #include <windows.h>
+#include <winternl.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <aclapi.h>
@@ -214,6 +215,13 @@ bool CheckDebuggersAdvanced() {
     return false;
 }
 
+// ================= FORWARD DECLARATIONS =================
+bool CheckDebuggerNtApi();
+bool ScanSuspiciousWindows();
+bool ScanSuspiciousDrivers();
+bool ScanInjectedDLLs();
+bool DetectExternalHandles();
+
 // ================= CORE LOGIC =================
 
 void InitSharedMemory() {
@@ -369,29 +377,26 @@ bool IsAutoStartIntact() {
     return result == ERROR_SUCCESS;
 }
 
+// Forward declaration
+void SetProcessCritical(bool enable);
+
 // 5. Uninstall: Hapus semua registry entries dan log file
 void CleanupAndUninstall() {
-    // Hapus auto-start dari Run key
+    SetProcessCritical(false); // WAJIB disable sebelum exit!
+
     RemoveAutoStart();
     WriteLog("UNINSTALL: Auto-start removed.");
 
-    // Hapus config key HKCU\SOFTWARE\SPAntiCheat beserta semua values
     LONG result = RegDeleteKeyW(HKEY_CURRENT_USER, REG_APP_KEY);
     if (result == ERROR_SUCCESS) {
         WriteLog("UNINSTALL: Registry config key deleted.");
     }
 
-    // Cleanup shared memory
     if (pSharedHeartbeat) { UnmapViewOfFile(pSharedHeartbeat); pSharedHeartbeat = NULL; }
     if (hMapFile) { CloseHandle(hMapFile); hMapFile = NULL; }
-
-    // Cleanup game handle
     if (hGame) { CloseHandle(hGame); hGame = NULL; }
 
     WriteLog("UNINSTALL: Cleanup complete. SPAntiCheat uninstalled.");
-
-    // Hapus log file terakhir (opsional)
-    // DeleteFileW(L"SPAntiCheat.log");
 }
 
 
@@ -445,10 +450,69 @@ bool ProtectProcess() {
     return false;
 }
 
+// ================= WATCHDOG & ENHANCED PROTECTION =================
+
+// Function pointer type untuk RtlSetProcessIsCritical (ntdll)
+typedef LONG(NTAPI* pRtlSetProcessIsCritical)(BOOLEAN bNew, BOOLEAN* pbOld, BOOLEAN bNeedScb);
+
+// Set proses sebagai "critical" - killing akan menyebabkan BSOD (sangat agresif)
+void SetProcessCritical(bool enable) {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return;
+
+    auto fnRtlSetProcessIsCritical = (pRtlSetProcessIsCritical)
+        GetProcAddress(hNtdll, "RtlSetProcessIsCritical");
+    if (fnRtlSetProcessIsCritical) {
+        BOOLEAN old;
+        fnRtlSetProcessIsCritical(enable ? TRUE : FALSE, &old, FALSE);
+        WriteLog(enable ? "PROTECT: Process marked as CRITICAL." : "PROTECT: Critical flag removed.");
+    }
+}
+
+// Watchdog: Spawn salinan diri sendiri yang saling mengawasi
+void SpawnWatchdog() {
+    WCHAR exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    // Buat named mutex agar watchdog tahu parent masih hidup
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\SPAC_ParentAlive_V1");
+    if (!hMutex) return;
+
+    // Loop: jika mutex hilang (parent di-kill), respawn
+    std::thread([]() {
+        while (true) {
+            Sleep(3000);
+            // Cek apakah anti-cheat masih jalan
+            HANDLE hCheck = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\SPAC_ParentAlive_V1");
+            if (hCheck) {
+                CloseHandle(hCheck);
+            }
+            else {
+                // Parent di-kill! Langsung terminate game
+                DWORD gamePID = GetPIDByName(TARGET_GAME);
+                if (gamePID != 0) {
+                    HANDLE hKill = OpenProcess(PROCESS_TERMINATE, FALSE, gamePID);
+                    if (hKill) {
+                        TerminateProcess(hKill, 0xDEAD0003);
+                        CloseHandle(hKill);
+                    }
+                }
+                // Respawn anti-cheat
+                WCHAR path[MAX_PATH];
+                GetModuleFileNameW(NULL, path, MAX_PATH);
+                ShellExecuteW(NULL, L"runas", path, NULL, NULL, SW_HIDE);
+                break;
+            }
+        }
+    }).detach();
+}
+
 void AntiCheatLoop() {
-    InitLog(); // Reset log setiap kali anti-cheat mulai jalan
+    InitLog();
     EnableDebugPrivilege();
     ProtectProcess();
+    SetProcessCritical(true);
+    SpawnWatchdog();
 
     InitSharedMemory();
     InitCRC32Table();
@@ -459,19 +523,24 @@ void AntiCheatLoop() {
     WriteLog("SYSTEM: Integrity Hash: " + std::to_string(originalCRC));
     WriteLog("SYSTEM: Advanced Security Active.");
 
-    // === REGISTRY SETUP ===
     RegisterAutoStart();
     SaveConfigToRegistry();
 
     int integrityCheckCounter = 0;
+    int deepScanCounter = 0;
 
     while (true) {
         if (pSharedHeartbeat) {
             *pSharedHeartbeat = GetTickCount64();
         }
 
+        // === FAST CHECKS (setiap loop / 500ms) ===
         if (CheckDebuggersAdvanced()) {
             ForceCloseGame("Advanced Debugger Detected");
+        }
+
+        if (CheckDebuggerNtApi()) {
+            ForceCloseGame("NtAPI Debugger Detected");
         }
 
         targetPID = GetPIDByName(TARGET_GAME);
@@ -479,26 +548,47 @@ void AntiCheatLoop() {
         if (targetPID != 0) {
             if (!hGame) {
                 hGame = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, FALSE, targetPID);
-                UpdateTrayTooltip(L"SPAntiCheat: Protecting LostSaga");
+                UpdateTrayTooltip(L"SPAntiCheat: Protect");
                 gameHasStarted = true;
             }
 
             ScanBlacklistedTools();
 
+            // === MEDIUM CHECKS (setiap 5 loop / ~2.5 detik) ===
+            deepScanCounter++;
+            if (deepScanCounter > 5) {
+                if (ScanSuspiciousWindows()) {
+                    ForceCloseGame("Suspicious Window Detected");
+                }
+
+                if (ScanSuspiciousDrivers()) {
+                    ForceCloseGame("Cheat Driver Detected");
+                }
+
+                deepScanCounter = 0;
+            }
+
+            // === SLOW CHECKS (setiap 10 loop / ~5 detik) ===
             integrityCheckCounter++;
             if (integrityCheckCounter > 10) {
                 DWORD currentCRC = CalculateFileCRC32(path);
                 if (currentCRC != originalCRC) ForceCloseGame("Anti-Cheat File Tampered/Patched");
 
-                // Cek apakah cheater menghapus auto-start dari registry
+                if (ScanInjectedDLLs()) {
+                    ForceCloseGame("Suspicious DLL Injected into Game");
+                }
+
+                if (DetectExternalHandles()) {
+                    ForceCloseGame("External Process Reading Game Memory");
+                }
+
                 if (!IsAutoStartIntact()) {
                     WriteLog("REGISTRY: Auto-start was removed! Re-registering...");
                     RegisterAutoStart();
                 }
 
-                // Verify registry integrity
                 if (!VerifyRegistryIntegrity()) {
-                    SaveConfigToRegistry(); // Re-save jika di-tamper
+                    SaveConfigToRegistry();
                 }
 
                 integrityCheckCounter = 0;
@@ -507,6 +597,7 @@ void AntiCheatLoop() {
         else {
             if (gameHasStarted) {
                 WriteLog("MONITOR: Game Closed. Exiting...");
+                SetProcessCritical(false);
                 if (hMainWnd) PostMessage(hMainWnd, WM_CLOSE, 0, 0);
                 else exit(0);
                 break;
@@ -608,4 +699,377 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         DispatchMessage(&msg);
     }
     return (int)msg.wParam;
+}
+
+// ================= WINDOW SCANNING =================
+
+struct WindowScanResult {
+    bool found;
+    std::wstring detectedTitle;
+};
+
+std::vector<std::wstring> windowBlacklist = {
+    L"cheat engine", L"ce main window", L"celua",
+    L"x64dbg", L"x32dbg", L"ollydbg",
+    L"ida -", L"ida pro", L"idafree",
+    L"process hacker", L"system informer",
+    L"reclass.net", L"reclass",
+    L"http debugger", L"httpdebugger",
+    L"dll injector", L"extreme injector",
+    L"ghidra", L"binary ninja"
+};
+
+std::vector<std::wstring> classBlacklist = {
+    L"WinDbgFrameClass",          // WinDbg
+    L"PROCEXPL",                  // Process Explorer
+    L"Qt5QWindowIcon",            // x64dbg, Ghidra (Qt apps)
+    L"SunAwtFrame",               // Ghidra (Java)
+};
+
+BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam) {
+    auto* result = (WindowScanResult*)lParam;
+
+    WCHAR title[512] = { 0 };
+    WCHAR className[256] = { 0 };
+    GetWindowTextW(hwnd, title, 512);
+    GetClassNameW(hwnd, className, 256);
+
+    std::wstring titleLower = ToLower(title);
+    std::wstring classLower = ToLower(className);
+
+    for (const auto& bad : windowBlacklist) {
+        if (titleLower.find(bad) != std::wstring::npos) {
+            result->found = true;
+            result->detectedTitle = title;
+            return FALSE; // Stop enumerating
+        }
+    }
+
+    for (const auto& bad : classBlacklist) {
+        if (classLower.find(ToLower(bad)) != std::wstring::npos) {
+            result->found = true;
+            result->detectedTitle = className;
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+bool ScanSuspiciousWindows() {
+    WindowScanResult result = { false, L"" };
+    EnumWindows(EnumWindowsCallback, (LPARAM)&result);
+    if (result.found) {
+        WriteLog("DETECT: Suspicious Window -> " + WStringToString(result.detectedTitle));
+    }
+    return result.found;
+}
+
+// ================= DLL INJECTION DETECTION =================
+
+// Daftar DLL yang sah (whitelist) - sesuaikan dengan game
+std::vector<std::wstring> dllWhitelist = {
+    L"kernel32.dll", L"ntdll.dll", L"user32.dll", L"gdi32.dll",
+    L"advapi32.dll", L"shell32.dll", L"ws2_32.dll", L"wsock32.dll",
+    L"d3d9.dll", L"d3d11.dll", L"dxgi.dll", L"opengl32.dll",
+    L"msvcrt.dll", L"msvcp140.dll", L"vcruntime140.dll",
+    L"lostsaga.exe",  // Module utama game
+};
+
+// DLL yang pasti berbahaya (blacklist)
+std::vector<std::wstring> dllBlacklist = {
+    L"speedhack", L"cheatengine", L"ce-mono",
+    L"d3d9_proxy", L"opengl_hook",
+};
+
+// Tambahkan whitelist untuk path software sah
+std::vector<std::wstring> trustedPaths = {
+    L"\\program files\\",
+    L"\\program files (x86)\\",
+    L"\\windows\\",
+    L"\\steam\\",
+    L"\\discord\\",
+    L"\\nvidia\\",
+    L"\\amd\\",
+    L"\\windhawk\\",
+    L"\\microsoft\\",
+    L"\\common files\\",
+};
+
+bool ScanInjectedDLLs() {
+    if (targetPID == 0) return false;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, targetPID);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+
+    MODULEENTRY32W me = { 0 };
+    me.dwSize = sizeof(me);
+
+    bool suspicious = false;
+
+    if (Module32FirstW(hSnap, &me)) {
+        do {
+            std::wstring modName = ToLower(me.szModule);
+            std::wstring modPath = ToLower(me.szExePath);
+
+            // Cek blacklist dulu
+            for (const auto& bad : dllBlacklist) {
+                if (modName.find(bad) != std::wstring::npos || modPath.find(bad) != std::wstring::npos) {
+                    WriteLog("DETECT: Blacklisted DLL in game -> " + WStringToString(modName));
+                    CloseHandle(hSnap);
+                    return true;
+                }
+            }
+
+            // Skip DLL dari trusted paths (Program Files, Windows, Steam, dll)
+            bool isTrusted = false;
+            for (const auto& trusted : trustedPaths) {
+                if (modPath.find(trusted) != std::wstring::npos) {
+                    isTrusted = true;
+                    break;
+                }
+            }
+            if (isTrusted) continue;
+
+            // Cek lokasi sistem
+            bool isSystem = modPath.find(L"\\windows\\system32\\") != std::wstring::npos ||
+                            modPath.find(L"\\windows\\syswow64\\") != std::wstring::npos ||
+                            modPath.find(L"\\windows\\winsxs\\") != std::wstring::npos;
+
+            // Ambil folder game
+            WCHAR gamePath[MAX_PATH];
+            if (hGame) {
+                GetModuleFileNameExW(hGame, NULL, gamePath, MAX_PATH);
+                std::wstring gameDir = ToLower(gamePath);
+                size_t lastSlash = gameDir.rfind(L'\\');
+                if (lastSlash != std::wstring::npos) {
+                    gameDir = gameDir.substr(0, lastSlash);
+                    if (modPath.find(gameDir) != std::wstring::npos) isSystem = true;
+                }
+            }
+
+            if (!isSystem) {
+                WriteLog("SUSPECT: Unknown DLL -> " + WStringToString(modName) +
+                         " Path: " + WStringToString(std::wstring(me.szExePath)));
+                // Jangan langsung return true - hanya log saja untuk sekarang
+                // suspicious = true;  // DIKOMENTARI untuk menghindari false positive
+            }
+
+        } while (Module32NextW(hSnap, &me));
+    }
+
+    CloseHandle(hSnap);
+    return suspicious;
+}
+
+// ================= DEEP DEBUGGER DETECTION (NTAPI) =================
+
+typedef NTSTATUS(NTAPI* pNtQueryInformationProcess)(
+    HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+bool CheckDebuggerNtApi() {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return false;
+
+    auto NtQIP = (pNtQueryInformationProcess)
+        GetProcAddress(hNtdll, "NtQueryInformationProcess");
+    if (!NtQIP) return false;
+
+    // 1. ProcessDebugPort (0x07) - Paling reliable
+    DWORD_PTR debugPort = 0;
+    NTSTATUS status = NtQIP(GetCurrentProcess(), 7, &debugPort, sizeof(debugPort), NULL);
+    if (status == 0 && debugPort != 0) {
+        WriteLog("DETECT: NtAPI - DebugPort active.");
+        return true;
+    }
+
+    // 2. ProcessDebugObjectHandle (0x1E)
+    HANDLE debugObject = NULL;
+    status = NtQIP(GetCurrentProcess(), 0x1E, &debugObject, sizeof(debugObject), NULL);
+    if (status == 0) { // STATUS_SUCCESS = ada debug object
+        WriteLog("DETECT: NtAPI - DebugObjectHandle found.");
+        return true;
+    }
+
+    // 3. ProcessDebugFlags (0x1F) - 0 = being debugged
+    DWORD debugFlags = 1;
+    status = NtQIP(GetCurrentProcess(), 0x1F, &debugFlags, sizeof(debugFlags), NULL);
+    if (status == 0 && debugFlags == 0) {
+        WriteLog("DETECT: NtAPI - DebugFlags indicate debugging.");
+        return true;
+    }
+
+    return false;
+}
+
+// ================= KERNEL DRIVER DETECTION =================
+
+bool ScanSuspiciousDrivers() {
+    // Nama-nama driver yang dipakai cheat tools
+    std::vector<std::wstring> driverBlacklist = {
+        L"dbk64.sys", L"dbk32.sys",           // Cheat Engine
+        L"kprocesshacker.sys",                  // Process Hacker
+        L"systeminformer.sys",                  // System Informer
+        L"kdmapper.sys",                        // Manual mapper
+        L"capcom.sys",                          // Capcom exploit
+        L"iqvw64e.sys",                         // Intel vuln driver (exploit)
+    };
+
+    // Method 1: EnumDeviceDrivers
+    LPVOID drivers[1024];
+    DWORD cbNeeded;
+    if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
+        int driverCount = cbNeeded / sizeof(LPVOID);
+        for (int i = 0; i < driverCount; i++) {
+            WCHAR driverName[MAX_PATH];
+            if (GetDeviceDriverBaseNameW(drivers[i], driverName, MAX_PATH)) {
+                std::wstring name = ToLower(driverName);
+                for (const auto& bad : driverBlacklist) {
+                    if (name.find(ToLower(bad)) != std::wstring::npos) {
+                        WriteLog("DETECT: Suspicious Driver -> " + WStringToString(name));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Method 2: Cek device handle yang dibuat Cheat Engine
+    HANDLE hDevice = CreateFileW(L"\\\\.\\CEDRIVER73", GENERIC_READ, 0, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hDevice != INVALID_HANDLE_VALUE) {
+        CloseHandle(hDevice);
+        WriteLog("DETECT: Cheat Engine kernel driver device found!");
+        return true;
+    }
+
+    return false;
+}
+
+// ================= HANDLE HIJACKING DETECTION =================
+
+typedef NTSTATUS(NTAPI* pNtQuerySystemInformation)(
+    ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength, PULONG ReturnLength);
+
+#pragma pack(push, 1)
+typedef struct _SYSTEM_HANDLE_ENTRY {
+    ULONG  ProcessId;
+    BYTE   ObjectTypeNumber;
+    BYTE   Flags;
+    USHORT Handle;
+    PVOID  Object;
+    ACCESS_MASK GrantedAccess;
+} SYSTEM_HANDLE_ENTRY;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION {
+    ULONG HandleCount;
+    SYSTEM_HANDLE_ENTRY Handles[1];
+} SYSTEM_HANDLE_INFORMATION;
+#pragma pack(pop)
+
+bool DetectExternalHandles() {
+    if (targetPID == 0) return false;
+
+    // Whitelist proses sistem yang sah
+    std::vector<std::wstring> trustedProcesses = {
+        L"svchost.exe",
+        L"csrss.exe",
+        L"lsass.exe",
+        L"services.exe",
+        L"wininit.exe",
+        L"smss.exe",
+        L"dwm.exe",
+        L"explorer.exe",
+        L"taskmgr.exe",
+        L"msmpeng.exe",         // Windows Defender
+        L"securityhealthservice.exe",
+        L"mrt.exe",             // Malicious Software Removal Tool
+        L"spanticheat.exe",     // Anti-cheat sendiri (lowercase)
+    };
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) return false;
+
+    auto NtQSI = (pNtQuerySystemInformation)
+        GetProcAddress(hNtdll, "NtQuerySystemInformation");
+    if (!NtQSI) return false;
+
+    ULONG bufferSize = 1024 * 1024;
+    PVOID buffer = VirtualAlloc(NULL, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!buffer) return false;
+
+    NTSTATUS status;
+    while ((status = NtQSI(16, buffer, bufferSize, NULL)) == 0xC0000004L) {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        bufferSize *= 2;
+        if (bufferSize > 64 * 1024 * 1024) return false;
+        buffer = VirtualAlloc(NULL, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buffer) return false;
+    }
+
+    if (status != 0) {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return false;
+    }
+
+    auto* handleInfo = (SYSTEM_HANDLE_INFORMATION*)buffer;
+    DWORD myPID = GetCurrentProcessId();
+    bool suspicious = false;
+
+    const ACCESS_MASK dangerousMask = PROCESS_VM_READ | PROCESS_VM_WRITE |
+        PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD;
+
+    for (ULONG i = 0; i < handleInfo->HandleCount; i++) {
+        auto& h = handleInfo->Handles[i];
+
+        if (h.ProcessId == myPID || h.ProcessId == targetPID ||
+            h.ProcessId == 0 || h.ProcessId == 4) continue;
+
+        if ((h.GrantedAccess & dangerousMask) != 0) {
+            HANDLE hProc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
+                FALSE, h.ProcessId);
+            if (hProc) {
+                HANDLE dupHandle;
+                if (DuplicateHandle(hProc, (HANDLE)(ULONG_PTR)h.Handle,
+                    GetCurrentProcess(), &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+
+                    DWORD handlePID = GetProcessId(dupHandle);
+                    if (handlePID == targetPID) {
+                        WCHAR procName[MAX_PATH] = { 0 };
+                        GetModuleFileNameExW(hProc, NULL, procName, MAX_PATH);
+                        std::wstring procNameLower = ToLower(procName);
+
+                        // Cek apakah proses ada di whitelist
+                        bool isTrusted = false;
+                        for (const auto& trusted : trustedProcesses) {
+                            if (procNameLower.find(trusted) != std::wstring::npos) {
+                                isTrusted = true;
+                                break;
+                            }
+                        }
+
+                        // Cek path sistem
+                        if (procNameLower.find(L"\\windows\\") != std::wstring::npos ||
+                            procNameLower.find(L"\\program files\\") != std::wstring::npos ||
+                            procNameLower.find(L"\\program files (x86)\\") != std::wstring::npos) {
+                            isTrusted = true;
+                        }
+
+                        if (!isTrusted) {
+                            WriteLog("DETECT: External handle to game from PID " +
+                                std::to_string(h.ProcessId) + " -> " + WStringToString(procName));
+                            suspicious = true;
+                        }
+                    }
+                    CloseHandle(dupHandle);
+                }
+                CloseHandle(hProc);
+            }
+        }
+        if (suspicious) break;
+    }
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    return suspicious;
 }

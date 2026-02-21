@@ -8,6 +8,7 @@
 
 void* DetourFunction(BYTE* src, DWORD dst, const int len) {
 	BYTE* jmp = (BYTE*)malloc(len + 5);
+	if (!jmp) return NULL;
 	DWORD dwBack;
 	VirtualProtect(src, len, PAGE_EXECUTE_READWRITE, &dwBack);
 	memcpy(jmp, src, len);
@@ -35,7 +36,7 @@ DWORD Exit24JMP = 0;
 
 void TranslateString()
 {
-	DWORD GetGameStart = (DWORD)GetModuleHandleA('lostsaga.exe');
+	DWORD GetGameStart = (DWORD)GetModuleHandleA("lostsaga.exe");
 	DWORD InitStart = (DWORD) GetGameStart + 0x105EF66;
 	BYTE* jmpInit = NULL;
 	BYTE* jmpExit23 = NULL;
@@ -43,6 +44,6 @@ void TranslateString()
 	
 	while (true)
 	{
-		DetourFunction((PBYTE)InitStart, (DWORD)InitComplete, 5;
+		DetourFunction((PBYTE)InitStart, (DWORD)InitComplete, 5);
 	}
 }
