@@ -1056,6 +1056,20 @@ bool DetectExternalHandles() {
                             isTrusted = true;
                         }
 
+                        // [FIX] Cek apakah proses berasal dari folder game yang sama
+                        if (!isTrusted && hGame) {
+                            WCHAR gamePath[MAX_PATH];
+                            GetModuleFileNameExW(hGame, NULL, gamePath, MAX_PATH);
+                            std::wstring gameDir = ToLower(gamePath);
+                            size_t lastSlash = gameDir.rfind(L'\\');
+                            if (lastSlash != std::wstring::npos) {
+                                gameDir = gameDir.substr(0, lastSlash);
+                                if (procNameLower.find(gameDir) != std::wstring::npos) {
+                                    isTrusted = true; // Proses dari folder game = trusted
+                                }
+                            }
+                        }
+
                         if (!isTrusted) {
                             WriteLog("DETECT: External handle to game from PID " +
                                 std::to_string(h.ProcessId) + " -> " + WStringToString(procName));
